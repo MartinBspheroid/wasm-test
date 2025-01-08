@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::io::Result as IoResult;
+use std::rc::Rc;
 
 use ratatui::backend::WindowSize;
 use ratatui::buffer::Cell;
@@ -10,17 +12,19 @@ use web_sys::wasm_bindgen::JsCast;
 use web_sys::window;
 use web_sys::Document;
 use web_sys::Element;
+use web_sys::Window;
 
 use crate::utils::*;
 use crate::widgets::HYPERLINK;
 
 #[derive(Debug)]
 pub struct WasmBackend {
-    initialized: bool,
+    initialized: Rc<RefCell<bool>>,
     buffer: Vec<Vec<Cell>>,
     prev_buffer: Vec<Vec<Cell>>,
     cells: Vec<Element>,
     grid: Element,
+    window: Window,
     document: Document,
 }
 
@@ -37,19 +41,20 @@ impl WasmBackend {
         let document = window.document().unwrap();
         let div = document.create_element("div").unwrap();
         div.set_attribute("id", "grid").unwrap();
-        let body = document.body().unwrap();
-        body.append_child(&div).unwrap();
-
-        Self {
+        let mut backend = Self {
             buffer: get_sized_buffer(),
             prev_buffer: get_sized_buffer(),
-            grid: div,
-            document,
             cells: vec![],
-            initialized: false,
-        }
+            grid: div,
+            window,
+            document,
+            initialized: Rc::new(RefCell::new(false)),
+        };
+        backend.add_on_resize_listener();
+        backend
     }
 
+    /// This function is called from [`flush`] once to render the initial content to the screen.
     fn prerender(&mut self) {
         web_sys::console::log_1(&"hello from prerender".into());
 
@@ -95,7 +100,8 @@ impl WasmBackend {
         }
     }
 
-    // here's the deal, we compare the current buffer to the previous buffer and update only the cells that have changed since the last render call
+    // Compare the current buffer to the previous buffer and update only the cells that have
+    // changed since the last render call.
     fn update_grid(&mut self) {
         for (y, line) in self.buffer.iter().enumerate() {
             for (x, cell) in line.iter().enumerate() {
@@ -113,6 +119,16 @@ impl WasmBackend {
             }
         }
     }
+
+    fn add_on_resize_listener(&mut self) {
+        let initialized = self.initialized.clone();
+        let closure = Closure::<dyn FnMut(_)>::new(move |_: web_sys::Event| {
+            initialized.replace(false);
+        });
+        self.window
+            .set_onresize(Some(closure.as_ref().unchecked_ref()));
+        closure.forget();
+    }
 }
 
 impl Backend for WasmBackend {
@@ -120,15 +136,54 @@ impl Backend for WasmBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
+        if !*self.initialized.borrow() {
+            // Only runs on resize event.
+            if let Some(grid) = self.document.get_element_by_id("grid") {
+                grid.remove();
+                self.cells.clear();
+                self.grid = self.document.create_element("div").unwrap();
+                self.grid.set_attribute("id", "grid").unwrap();
+                self.buffer = get_sized_buffer();
+                self.prev_buffer = self.buffer.clone();
+            }
+        }
         // web_sys::console::log_1(&"hello from draw".into());
+
+        // Update the cells with new content
         for (x, y, cell) in content {
             let y = y as usize;
             let x = x as usize;
-            let line = &mut self.buffer[y];
-            line.extend(std::iter::repeat_with(Cell::default).take(x.saturating_sub(line.len())));
-            line[x] = cell.clone();
+            if y < self.buffer.len() {
+                let line = &mut self.buffer[y];
+                line.extend(
+                    std::iter::repeat_with(Cell::default).take(x.saturating_sub(line.len())),
+                );
+                if x < line.len() {
+                    line[x] = cell.clone();
+                }
+            }
         }
         // web_sys::console::log_1(&"hello from draw end ".into());
+        Ok(())
+    }
+
+    /// The flush is called after the draw function to actually render the content to the screen.
+    fn flush(&mut self) -> IoResult<()> {
+        if !*self.initialized.borrow() {
+            self.initialized.replace(true);
+
+            let body = self.document.body().unwrap();
+            body.append_child(&self.grid).unwrap();
+
+            self.prerender();
+            self.prev_buffer = self.buffer.clone(); // set the previous buffer to the current buffer for the first render
+        }
+        // web_sys::console::log_1(&"flush1".into());
+        // check if the buffer has changed since the last render and update the grid
+        if self.buffer != self.prev_buffer {
+            self.update_grid();
+        }
+        self.prev_buffer = self.buffer.clone();
         Ok(())
     }
 
@@ -162,22 +217,6 @@ impl Backend for WasmBackend {
 
     fn window_size(&mut self) -> IoResult<WindowSize> {
         todo!()
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        if !self.initialized {
-            // web_sys::console::log_1(&"hello from flush".into());
-            self.prerender();
-            self.prev_buffer = self.buffer.clone(); // set the previous buffer to the current buffer for the first render
-            self.initialized = true;
-        }
-        // web_sys::console::log_1(&"flush1".into());
-        // check if the buffer has changed since the last render and update the grid
-        if self.buffer != self.prev_buffer {
-            self.update_grid();
-        }
-        self.prev_buffer = self.buffer.clone();
-        Ok(())
     }
 
     fn get_cursor_position(&mut self) -> IoResult<Position> {
